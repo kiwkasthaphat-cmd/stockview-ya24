@@ -1048,6 +1048,65 @@ let CAT = null;
 try { const raw = localStorage.getItem('sv_catalog'); if (raw) CAT = JSON.parse(raw); } catch(e){}
 if (!CAT || !CAT.items || !CAT.items.length) CAT = DATA;
 
+/* ================= CW Bridge (same origin, read only) =================
+   Production URL: http://192.168.1.176:5000/
+   The Flask bridge must serve this index.html and the GET endpoints below.
+   Do not point the HTTPS GitHub Pages build at the notebook's HTTP address:
+   mobile browsers can block that request as mixed/private-network content. */
+const BRIDGE = Object.freeze({
+  health: '/health',
+  product: code => '/api/product/' + encodeURIComponent(code),
+  timeoutMs: 4500
+});
+let bridgeOnline = false;
+
+function bridgeItem(raw, askedCode){
+  if (!raw || typeof raw !== 'object') return null;
+  const code = String(raw.code || raw.product_code || raw.sku || askedCode || '').trim();
+  if (!code) return null;
+  const stock = Number(raw.stock ?? raw.qty ?? raw.quantity ?? raw.on_hand ?? 0);
+  const booking = Number(raw.booking ?? raw.booked ?? raw.reserved ?? 0);
+  const unit = String(raw.unit || raw.uom || '').trim();
+  const name = String(raw.name || raw.product_name || raw.description || code).trim();
+  const location = String(raw.location || raw.shelf || raw.bin || '-').trim() || '-';
+  return {
+    c:code, n:name, ne:name, q:Number.isFinite(stock)?stock:0,
+    booking:Number.isFinite(booking)?booking:0,
+    u:unit, ue:unit, l:location, le:location,
+    g:location.replace(/[0-9]+$/,'').toUpperCase() || '-', ge:location,
+    p:0, v:0, G:'D', d:0, live:true
+  };
+}
+
+async function bridgeGet(path){
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), BRIDGE.timeoutMs);
+  try {
+    const res = await fetch(path, {
+      method:'GET', credentials:'same-origin', cache:'no-store',
+      headers:{'Accept':'application/json'}, signal:ctl.signal
+    });
+    if (!res.ok) throw new Error('bridge '+res.status);
+    bridgeOnline = true;
+    return await res.json();
+  } finally { clearTimeout(timer); }
+}
+
+async function liveProduct(code){
+  try { return bridgeItem(await bridgeGet(BRIDGE.product(code)), code); }
+  catch(e){ bridgeOnline = false; return null; }
+}
+
+async function checkBridge(){
+  try { await bridgeGet(BRIDGE.health); }
+  catch(e){ bridgeOnline = false; }
+  const chip = document.getElementById('demoChip');
+  if (chip && location.protocol !== 'file:') {
+    chip.textContent = bridgeOnline ? 'CW LIVE · READ ONLY' : (CAT && CAT.src ? CAT.src : t().demo);
+    chip.classList.toggle('live', bridgeOnline || !!(CAT && CAT.src));
+  }
+}
+
 /* ================= catalog: recompute every derived figure ================= */
 const COLS = {
   c:['รหัสสินค้า','รหัส','sku','code','itemcode','item code','product code'],
@@ -1726,24 +1785,23 @@ function vOffline(){
 
   setTimeout(()=>{
     const inp=document.getElementById('ofScan'), go=document.getElementById('ofGo');
-    const run=()=>{
+    const run=async()=>{
       const v=(inp.value||'').trim(); if(!v) { inp.focus(); return; }
-      const hit=CAT.items.find(r=>r.c.toLowerCase()===v.toLowerCase()) ||
-                CAT.items.find(r=>(r.n+' '+r.ne).toLowerCase().indexOf(v.toLowerCase())!==-1);
+      const hit=await findByScan(v);
       const msg=document.getElementById('ofMsg');
       if(!hit){ msg.innerHTML='<div class="alertbox">'+esc(T_.of_notfound)+' '+esc(v)+'</div>';
                 inp.select(); return; }
       inp.value=''; msg.innerHTML=''; addScan(hit,1);
     };
     const cam=document.getElementById('ofCam');
-    if(cam) cam.addEventListener('click',()=>openCam((code, keep)=>{
+    if(cam) cam.addEventListener('click',()=>openCam(async(code, keep)=>{
       /* ให้ผู้ใช้เห็นเลขที่อ่านได้ในช่องบาร์โค้ดก่อนค้นสินค้า */
       const scanInput=document.getElementById('ofScan');
       if(scanInput){
         scanInput.value=code;
         scanInput.dispatchEvent(new Event('input',{bubbles:true}));
       }
-      const hit=findByScan(code);
+      const hit=await findByScan(code);
       if(!hit){
         const m=t().of_notfound+' '+code;
         const msg=document.getElementById('ofMsg');
@@ -2047,9 +2105,13 @@ function snOf(code){
   let h=0; for(let i=0;i<code.length;i++){ h=(h*31+code.charCodeAt(i))|0; }
   return '88'+String(50000000000+Math.abs(h)%49999999999);
 }
-function findByScan(v){
+async function findByScan(v){
   const q=String(v||'').trim(); if(!q) return null;
   const lq=q.toLowerCase();
+  /* Product codes are resolved from CW first. This is GET-only; count results
+     remain in localStorage and are never written back to CW/Pmc SQL. */
+  const live = await liveProduct(q);
+  if (live) return live;
   return CAT.items.find(r=>r.c.toLowerCase()===lq)
       || CAT.items.find(r=>snOf(r.c)===q)
       || CAT.items.find(r=>((r.n||'')+' '+(r.ne||'')).toLowerCase().indexOf(lq)!==-1)
@@ -2057,8 +2119,8 @@ function findByScan(v){
 }
 /* ปุ่มกล้องมาตรฐาน ใช้ได้ทุกหน้าที่มีการยิงบาร์โค้ด */
 function camButton(onItem){
-  return { label:t().cam_btn, on:()=>openCam((code, keep)=>{
-      const it=findByScan(code);
+  return { label:t().cam_btn, on:()=>openCam(async(code, keep)=>{
+      const it=await findByScan(code);
       if (!it){ const m=t().of_notfound+' '+code;
                 if (keep) camSay(m, true); else toast(m); return; }
       onItem(it);
@@ -2135,6 +2197,7 @@ document.addEventListener('keydown',e=>{
 try{ const th=localStorage.getItem('sv_theme'); if(th) applyTheme(th); }catch(e){}
 try{ const v=localStorage.getItem('sv_view'); if(v&&VIEWS[v]) current=v; }catch(e){}
 paintChrome();
+checkBridge();
 $('#enterBtn').addEventListener('click',()=>{
   $('#gate').hidden=true; $('#app').hidden=false;
   $('#nav').value=current; show(current); scrollTo(0,0);
